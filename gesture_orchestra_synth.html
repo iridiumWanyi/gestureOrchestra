@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Gesture Orchestra (Synth) — Web</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; background: #111; color: #eee;
+    font-family: -apple-system, system-ui, sans-serif;
+    display: flex; flex-direction: column; align-items: center; gap: 12px;
+    padding: 16px;
+  }
+  #wrap { position: relative; width: min(90vw, 900px); }
+  canvas { width: 100%; border-radius: 8px; background: #000; display: block; }
+  .row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  button {
+    font-size: 16px; padding: 10px 18px; border-radius: 8px; border: 0;
+    background: #2a7; color: #032; font-weight: 700; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { font-size: 14px; color: #9cf; min-height: 20px; text-align: center; }
+  label { font-size: 14px; user-select: none; }
+  .hint { font-size: 12px; color: #999; max-width: 900px; text-align: center; line-height: 1.5; }
+</style>
+</head>
+<body>
+  <h2 style="margin:4px 0">🎻 Gesture Orchestra — Synth (Web)</h2>
+  <div class="row">
+    <button id="startBtn">Start</button>
+    <label><input type="checkbox" id="swapHands" /> Swap L/R hands</label>
+  </div>
+  <div id="status">Click Start, then allow camera access.</div>
+  <div id="wrap">
+    <canvas id="canvas" width="960" height="540"></canvas>
+  </div>
+  <div class="hint">
+    <b>Right</b> index finger: <b>raise</b> it to the upper line to play the <b>black keys</b> (sharps),
+    <b>lower</b> it to the lower line for the <b>white keys</b>; move sideways to pick the note (C3–C5, left = low, right = high).
+    <b>Left</b> hand openness → volume (fist = silent, spread = full).<br />
+    Camera needs a secure context: open this file via <code>http://localhost</code> (e.g. <code>python3 -m http.server</code>) — <code>file://</code> may be blocked by the browser.
+  </div>
+
+<!-- MediaPipe Tasks Vision + the whole app, as an ES module -->
+<script type="module">
+import { HandLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+// ---------- Config (mirrors gesture_orchestra_synth.py) ----------
+const PITCH_X_LEFT = 0.04, PITCH_X_RIGHT = 0.96;   // finger x zone (near full width)
+const OPEN_RATIO_FIST = 0.55, OPEN_RATIO_OPEN = 1.30;  // openness -> volume
+const MAX_VOLUME = 0.5;                              // soft overall level
+const FINGERS = [[8,5],[12,9],[16,13],[20,17]];     // (tip, mcp) for the 4 long fingers
+const INDEX_TIP = 8;
+// Two note rows spanning C3..C5. UPPER line = black keys (sharps), LOWER line =
+// white keys. The finger's VERTICAL position picks the row (up = black, down =
+// white); its HORIZONTAL position picks the note within that row.
+const RULER_Y_BLACK = 0.28;   // upper line (black keys / sharps)
+const RULER_Y_WHITE = 0.40;   // lower line (white keys / naturals)
+const ROW_SPLIT_Y = 0.34;     // finger y above this -> black row, below -> white
+
+const NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+function noteFreq(name){
+  const m = NAMES.indexOf(name.slice(0,-1));
+  const octv = parseInt(name.slice(-1), 10);
+  const midi = (octv + 1) * 12 + m;
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+// Build the white row (C3..C5, evenly spaced) and the black row (sharps placed
+// piano-style at the midpoint between the two white keys they sit between).
+function buildKeys(){
+  const order = ["C","D","E","F","G","A","B"];
+  const whiteNames = [];
+  let oct = 3, i = order.indexOf("C");
+  while(true){
+    whiteNames.push(order[i] + oct);
+    if(order[i] + oct === "C5") break;
+    i = (i + 1) % 7; if(i === 0) oct++;
+  }
+  const nW = whiteNames.length;
+  const white = whiteNames.map((name, k) => ({
+    name, freq: noteFreq(name),
+    x: PITCH_X_LEFT + (k / (nW - 1)) * (PITCH_X_RIGHT - PITCH_X_LEFT),
+  }));
+  const black = [];
+  for(let k = 0; k < nW - 1; k++){
+    const semis = Math.round(12 * Math.log2(white[k + 1].freq / white[k].freq));
+    if(semis === 2){                                    // whole tone -> a black key fits
+      const name = white[k].name[0] + "#" + white[k].name.slice(1);
+      black.push({ name, freq: noteFreq(name), x: (white[k].x + white[k + 1].x) / 2 });
+    }
+  }
+  return { white, black };
+}
+const KEYS = buildKeys();
+const DEFAULT_FREQ = noteFreq("C4");
+
+// Hand skeleton connections (standard 21-landmark hand).
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]
+];
+
+// ---------- Audio: soft detuned string ensemble ----------
+let audio = null;
+function buildAudio(){
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const master = ctx.createGain();
+  master.gain.value = 0.0;                 // driven by hand openness
+  // Warmth: low-pass, then a gentle compressor to stay clean.
+  const lp = ctx.createBiquadFilter();
+  lp.type = "lowpass"; lp.frequency.value = 1600; lp.Q.value = 0.3;   // softer: cut highs
+  const comp = ctx.createDynamicsCompressor();
+  master.connect(lp); lp.connect(comp); comp.connect(ctx.destination);
+
+  // Each "player": octave, gain, static detune (cents) + own vibrato.
+  const voices = [
+    {oct:0.5, g:0.40, det:-6}, {oct:1, g:0.80, det:-8}, {oct:1, g:0.90, det:-3},
+    {oct:1, g:0.90, det:2},   {oct:1, g:0.80, det:7},  {oct:2, g:0.26, det:-5},
+    {oct:2, g:0.22, det:6},
+  ];
+  const oscs = [];
+  voices.forEach((v, i) => {
+    const osc = ctx.createOscillator();
+    osc.type = "triangle";                 // softer/rounder than sawtooth
+    osc.frequency.value = DEFAULT_FREQ;    // start mid-range (C4)
+    osc.detune.value = v.det;
+    const g = ctx.createGain();
+    g.gain.value = v.g * 0.16;
+    // Independent gentle vibrato -> lush, non-mechanical.
+    const lfo = ctx.createOscillator();
+    lfo.frequency.value = 4.6 + 0.3 * i;   // slightly different per voice
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.value = 5 + (i % 3);      // cents of vibrato
+    lfo.connect(lfoGain); lfoGain.connect(osc.detune);
+    osc.connect(g); g.connect(master);
+    osc.start(); lfo.start();
+    oscs.push({osc, v});
+  });
+  return { ctx, master, oscs };
+}
+function setPitch(freq){
+  if(!audio) return;
+  const t = audio.ctx.currentTime;
+  for(const {osc, v} of audio.oscs){
+    // short glide avoids clicks on the snap
+    osc.frequency.setTargetAtTime(freq * v.oct, t, 0.03);
+  }
+}
+function setVolume(vol){
+  if(!audio) return;
+  audio.master.gain.setTargetAtTime(vol * MAX_VOLUME, audio.ctx.currentTime, 0.05);
+}
+
+// ---------- Hand helpers ----------
+function dist(a, b){
+  const dx=a.x-b.x, dy=a.y-b.y, dz=(a.z||0)-(b.z||0);
+  return Math.hypot(dx, dy, dz);
+}
+function handOpenness(lm){
+  const palm = dist(lm[0], lm[9]);
+  if(palm < 1e-6) return 0;
+  let total = 0;
+  for(const [tip,mcp] of FINGERS) total += dist(lm[tip], lm[mcp]);
+  return (total / FINGERS.length) / palm;
+}
+function ratioToVolume(r){
+  return Math.max(0, Math.min(1, (r - OPEN_RATIO_FIST) / (OPEN_RATIO_OPEN - OPEN_RATIO_FIST)));
+}
+function pickKey(fingerX, fingerY){
+  // Vertical position selects the row; horizontal snaps to the nearest key in it.
+  const isBlack = fingerY < ROW_SPLIT_Y;
+  const row = isBlack ? KEYS.black : KEYS.white;
+  let best = row[0], bd = Infinity;
+  for(const key of row){
+    const d = Math.abs(key.x - fingerX);
+    if(d < bd){ bd = d; best = key; }
+  }
+  return { key: best, isBlack };
+}
+
+// ---------- Main ----------
+const video = document.createElement("video");
+video.setAttribute("playsinline", "");
+const canvas = document.getElementById("canvas");
+const cx = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+const startBtn = document.getElementById("startBtn");
+const swapEl = document.getElementById("swapHands");
+
+let landmarker = null, running = false, lastVideoTime = -1;
+let current = { key: KEYS.white.find(k => k.name === "C4"), isBlack: false };
+
+async function start(){
+  startBtn.disabled = true;
+  try {
+    statusEl.textContent = "Loading hand model…";
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO", numHands: 2
+    });
+
+    statusEl.textContent = "Requesting camera…";
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 960, height: 540 }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+
+    audio = buildAudio();
+    if (audio.ctx.state === "suspended") await audio.ctx.resume();
+    setPitch(current.key.freq);
+
+    running = true;
+    statusEl.textContent = "Playing! Right index: up=black keys / down=white keys, move sideways = note · left hand = volume.";
+    requestAnimationFrame(loop);
+  } catch (err) {
+    statusEl.textContent = "Error: " + err.message + "  (Camera needs http://localhost or https.)";
+    startBtn.disabled = false;
+  }
+}
+
+function splitHands(res){
+  // Returns {pitch, volume} landmark arrays or null. Display is mirrored, so
+  // MediaPipe handedness matches the user's real hands; Swap fixes it if not.
+  let pitch = null, volume = null;
+  if(res.landmarks && res.handednesses){
+    for(let i=0;i<res.landmarks.length;i++){
+      let label = res.handednesses[i][0].categoryName; // 'Left' | 'Right'
+      if(swapEl.checked) label = (label === "Left") ? "Right" : "Left";
+      if(label === "Right") pitch = res.landmarks[i];
+      else volume = res.landmarks[i];
+    }
+  }
+  return { pitch, volume };
+}
+
+function loop(){
+  if(!running) return;
+  const w = canvas.width, h = canvas.height;
+
+  // Draw the camera mirrored (selfie view).
+  cx.save();
+  cx.translate(w, 0); cx.scale(-1, 1);
+  cx.drawImage(video, 0, 0, w, h);
+  cx.restore();
+
+  let pitchHand = null, volumeHand = null;
+  if(video.currentTime !== lastVideoTime){
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    const s = splitHands(res);
+    pitchHand = s.pitch; volumeHand = s.volume;
+
+    // Pitch: right index fingertip. x (mirrored) picks the note, y picks the
+    // row (up = black keys, down = white keys).
+    if(pitchHand){
+      const tip = pitchHand[INDEX_TIP];
+      current = pickKey(1 - tip.x, tip.y);
+      setPitch(current.key.freq);
+    }
+    // Volume: left hand openness (0 when absent).
+    setVolume(volumeHand ? ratioToVolume(handOpenness(volumeHand)) : 0);
+
+    // Stash for drawing this frame.
+    loop._pitch = pitchHand; loop._volume = volumeHand;
+  } else {
+    pitchHand = loop._pitch; volumeHand = loop._volume;
+  }
+
+  drawHand(pitchHand, "#0ff");
+  drawHand(volumeHand, "#0f0");
+  drawRuler(current, pitchHand ? (1 - pitchHand[INDEX_TIP].x) : null);
+
+  requestAnimationFrame(loop);
+}
+
+function drawHand(lm, color){
+  if(!lm) return;
+  const w = canvas.width, h = canvas.height;
+  const px = i => (1 - lm[i].x) * w, py = i => lm[i].y * h;  // mirror x
+  cx.strokeStyle = "rgba(200,200,200,0.8)"; cx.lineWidth = 2;
+  for(const [a,b] of HAND_CONNECTIONS){
+    cx.beginPath(); cx.moveTo(px(a), py(a)); cx.lineTo(px(b), py(b)); cx.stroke();
+  }
+  cx.fillStyle = color;
+  for(let i=0;i<lm.length;i++){ cx.beginPath(); cx.arc(px(i), py(i), 3, 0, 7); cx.fill(); }
+  // Emphasize the index fingertip on the pitch hand.
+  if(color === "#0ff"){
+    cx.strokeStyle = "#ff0"; cx.lineWidth = 3;
+    cx.beginPath(); cx.arc(px(INDEX_TIP), py(INDEX_TIP), 10, 0, 7); cx.stroke();
+  }
+}
+
+function drawRow(keys, yFrac, activeKey, isActiveRow, fingerX){
+  const w = canvas.width, h = canvas.height;
+  const y = Math.round(h * yFrac);
+  const xLo = PITCH_X_LEFT * w, xHi = PITCH_X_RIGHT * w;
+  cx.strokeStyle = isActiveRow ? "#fff" : "#777";
+  cx.lineWidth = isActiveRow ? 3 : 2;
+  cx.beginPath(); cx.moveTo(xLo, y); cx.lineTo(xHi, y); cx.stroke();
+
+  cx.textAlign = "center"; cx.textBaseline = "bottom";
+  for(const key of keys){
+    const x = key.x * w;
+    const active = (key === activeKey);
+    cx.strokeStyle = active ? "#ff0" : (isActiveRow ? "#ddd" : "#777");
+    cx.lineWidth = active ? 4 : 2;
+    const tick = active ? 20 : 13;
+    cx.beginPath(); cx.moveTo(x, y - tick); cx.lineTo(x, y + tick); cx.stroke();
+    cx.fillStyle = active ? "#ff0" : (isActiveRow ? "#ccc" : "#777");
+    cx.font = (active ? "bold 18px" : "13px") + " sans-serif";
+    cx.fillText(key.name, x, y - tick - 3);
+    if(active){ cx.beginPath(); cx.arc(x, y, 6, 0, 7); cx.fill(); }
+  }
+  if(isActiveRow && fingerX !== null){
+    const fx = Math.max(PITCH_X_LEFT, Math.min(PITCH_X_RIGHT, fingerX)) * w;
+    cx.fillStyle = "#f00"; cx.beginPath();
+    cx.moveTo(fx, y + 16); cx.lineTo(fx - 8, y + 32); cx.lineTo(fx + 8, y + 32);
+    cx.closePath(); cx.fill();
+  }
+}
+
+function drawRuler(current, fingerX){
+  const black = !!(current && current.isBlack);
+  // Upper line = black keys, lower line = white keys; active row is highlighted.
+  drawRow(KEYS.black, RULER_Y_BLACK, black ? current.key : null, black, black ? fingerX : null);
+  drawRow(KEYS.white, RULER_Y_WHITE, black ? null : (current && current.key), !black, black ? null : fingerX);
+
+  cx.fillStyle = "#fff"; cx.textAlign = "left"; cx.textBaseline = "top";
+  cx.font = "18px sans-serif";
+  const vol = audio ? Math.round(audio.master.gain.value / MAX_VOLUME * 100) : 0;
+  const nm = current ? current.key.name : "-";
+  cx.fillText(`Note: ${nm}  (${black ? "BLACK" : "WHITE"} row)   Volume: ${vol}%`, 16, 12);
+}
+
+startBtn.addEventListener("click", start);
+</script>
+</body>
+</html>
