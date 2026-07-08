@@ -38,6 +38,7 @@
   <div class="hint">
     <b>Right</b> index finger: <b>raise</b> it to the upper line to play the <b>black keys</b> (sharps),
     <b>lower</b> it to the lower line for the <b>white keys</b>; move sideways to pick the note (C3–C5, left = low, right = high).
+    Extend more <b>right</b>-hand fingers to play a chord on that note: 1 = single, 2 = major, 3 = minor, 4 = dominant 7th.
     <b>Left</b> hand openness → volume (fist = silent, spread = full).<br />
     Camera needs a secure context: open this file via <code>http://localhost</code> (e.g. <code>python3 -m http.server</code>) — <code>file://</code> may be blocked by the browser.
   </div>
@@ -103,7 +104,12 @@ const HAND_CONNECTIONS = [
   [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]
 ];
 
-// ---------- Audio: soft detuned string ensemble ----------
+// ---------- Audio: soft detuned string ensemble, polyphonic (chords) ----------
+// Right-hand finger count picks a chord built on the pointed note; we render the
+// full ensemble PER chord tone in its own "slot" (up to MAX_CHORD at once) and
+// fade unused slots out click-free -- mirroring TonePlayer in the Python synth.
+const MAX_CHORD = 4;
+const SEMITONE = Math.pow(2, 1 / 12);   // one-semitone frequency multiplier
 let audio = null;
 function buildAudio(){
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -121,32 +127,53 @@ function buildAudio(){
     {oct:1, g:0.90, det:2},   {oct:1, g:0.80, det:7},  {oct:2, g:0.26, det:-5},
     {oct:2, g:0.22, det:6},
   ];
-  const oscs = [];
-  voices.forEach((v, i) => {
-    const osc = ctx.createOscillator();
-    osc.type = "triangle";                 // softer/rounder than sawtooth
-    osc.frequency.value = DEFAULT_FREQ;    // start mid-range (C4)
-    osc.detune.value = v.det;
-    const g = ctx.createGain();
-    g.gain.value = v.g * 0.16;
-    // Independent gentle vibrato -> lush, non-mechanical.
-    const lfo = ctx.createOscillator();
-    lfo.frequency.value = 4.6 + 0.3 * i;   // slightly different per voice
-    const lfoGain = ctx.createGain();
-    lfoGain.gain.value = 5 + (i % 3);      // cents of vibrato
-    lfo.connect(lfoGain); lfoGain.connect(osc.detune);
-    osc.connect(g); g.connect(master);
-    osc.start(); lfo.start();
-    oscs.push({osc, v});
-  });
-  return { ctx, master, oscs };
+  // Build MAX_CHORD independent slots, each a full ensemble feeding its own gain
+  // node. Slot 0 is on; the rest sit silent until the chord grows into them.
+  const slots = [];
+  for(let s = 0; s < MAX_CHORD; s++){
+    const slotGain = ctx.createGain();
+    slotGain.gain.value = (s === 0) ? 1.0 : 0.0;
+    slotGain.connect(master);
+    const oscs = [];
+    voices.forEach((v, i) => {
+      const osc = ctx.createOscillator();
+      osc.type = "triangle";                 // softer/rounder than sawtooth
+      osc.frequency.value = DEFAULT_FREQ;    // start mid-range (C4)
+      osc.detune.value = v.det;
+      const g = ctx.createGain();
+      g.gain.value = v.g * 0.16;
+      // Independent gentle vibrato -> lush, non-mechanical (offset per slot too).
+      const lfo = ctx.createOscillator();
+      lfo.frequency.value = 4.6 + 0.3 * i + 0.05 * s;
+      const lfoGain = ctx.createGain();
+      lfoGain.gain.value = 5 + (i % 3);      // cents of vibrato
+      lfo.connect(lfoGain); lfoGain.connect(osc.detune);
+      osc.connect(g); g.connect(slotGain);
+      osc.start(); lfo.start();
+      oscs.push({osc, v});
+    });
+    slots.push({ slotGain, oscs });
+  }
+  return { ctx, master, slots };
 }
-function setPitch(freq){
+// Set the sounding chord (array of 1..MAX_CHORD frequencies). Unused slots fade
+// out; on-slots are scaled by 1/sqrt(n) so a chord isn't louder than a note.
+function setChord(freqs){
   if(!audio) return;
   const t = audio.ctx.currentTime;
-  for(const {osc, v} of audio.oscs){
-    // short glide avoids clicks on the snap
-    osc.frequency.setTargetAtTime(freq * v.oct, t, 0.03);
+  const n = Math.max(1, Math.min(freqs.length, MAX_CHORD));
+  const norm = 1 / Math.sqrt(n);
+  for(let s = 0; s < MAX_CHORD; s++){
+    const slot = audio.slots[s];
+    if(s < n){
+      for(const {osc, v} of slot.oscs){
+        // short glide avoids clicks on the snap
+        osc.frequency.setTargetAtTime(freqs[s] * v.oct, t, 0.03);
+      }
+      slot.slotGain.gain.setTargetAtTime(norm, t, 0.03);
+    } else {
+      slot.slotGain.gain.setTargetAtTime(0.0, t, 0.03);   // fade out (keep freq -> no click)
+    }
   }
 }
 function setVolume(vol){
@@ -168,6 +195,24 @@ function handOpenness(lm){
 }
 function ratioToVolume(r){
   return Math.max(0, Math.min(1, (r - OPEN_RATIO_FIST) / (OPEN_RATIO_OPEN - OPEN_RATIO_FIST)));
+}
+// Chords: right-hand finger count -> chord built on the pointed root note.
+// 1 finger (index only) = single note; each extra finger adds a richer chord.
+const CHORDS = {
+  1: { offsets: [0],          label: "single" },
+  2: { offsets: [0, 4, 7],    label: "major"  },
+  3: { offsets: [0, 3, 7],    label: "minor"  },
+  4: { offsets: [0, 4, 7, 10], label: "dom7"  },
+};
+// (tip, pip) for index/middle/ring/pinky -- extended if the tip is farther from
+// the wrist than its middle joint (works regardless of hand orientation).
+const EXT_FINGERS = [[8,6],[12,10],[16,14],[20,18]];
+function countExtended(lm){
+  const w = lm[0];
+  const far = i => Math.hypot(lm[i].x - w.x, lm[i].y - w.y);
+  let n = 0;
+  for(const [tip,pip] of EXT_FINGERS) if(far(tip) > far(pip)) n++;
+  return n;
 }
 function pickKey(fingerX, fingerY){
   // Vertical position selects the row; horizontal snaps to the nearest key in it.
@@ -192,6 +237,7 @@ const swapEl = document.getElementById("swapHands");
 
 let landmarker = null, running = false, lastVideoTime = -1;
 let current = { key: KEYS.white.find(k => k.name === "C4"), isBlack: false };
+let chordLabel = "single";
 
 async function start(){
   startBtn.disabled = true;
@@ -214,10 +260,10 @@ async function start(){
 
     audio = buildAudio();
     if (audio.ctx.state === "suspended") await audio.ctx.resume();
-    setPitch(current.key.freq);
+    setChord([current.key.freq]);
 
     running = true;
-    statusEl.textContent = "Playing! Right index: up=black keys / down=white keys, move sideways = note · left hand = volume.";
+    statusEl.textContent = "Playing! Right index: up=black keys / down=white keys, move sideways = note · fingers = chord · left hand = volume.";
     requestAnimationFrame(loop);
   } catch (err) {
     statusEl.textContent = "Error: " + err.message + "  (Camera needs http://localhost or https.)";
@@ -262,7 +308,11 @@ function loop(){
     if(pitchHand){
       const tip = pitchHand[INDEX_TIP];
       current = pickKey(1 - tip.x, tip.y);
-      setPitch(current.key.freq);
+      // Finger count -> chord built on the pointed note (fist falls back to single).
+      const chord = CHORDS[countExtended(pitchHand)] || CHORDS[1];
+      chordLabel = chord.label;
+      const root = current.key.freq;
+      setChord(chord.offsets.map(o => root * Math.pow(SEMITONE, o)));
     }
     // Volume: left hand openness (0 when absent).
     setVolume(volumeHand ? ratioToVolume(handOpenness(volumeHand)) : 0);
@@ -336,7 +386,7 @@ function drawRuler(current, fingerX){
   cx.font = "18px sans-serif";
   const vol = audio ? Math.round(audio.master.gain.value / MAX_VOLUME * 100) : 0;
   const nm = current ? current.key.name : "-";
-  cx.fillText(`Note: ${nm}  (${black ? "BLACK" : "WHITE"} row)   Volume: ${vol}%`, 16, 12);
+  cx.fillText(`Note: ${nm}  Chord: ${chordLabel}  (${black ? "BLACK" : "WHITE"} row)   Volume: ${vol}%`, 16, 12);
 }
 
 startBtn.addEventListener("click", start);
