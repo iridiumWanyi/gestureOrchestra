@@ -119,8 +119,14 @@ PITCH_X_RIGHT = 0.95            #            far right = C5
 RULER_Y_BLACK = 0.30             # upper line (black keys / sharps)
 RULER_Y_WHITE = 0.45             # lower line (white keys / naturals)
 ROW_SPLIT_Y = 0.375              # finger y above this -> black row, below -> white
-SETTLE_SPEED = 0.015             # hold the note while the finger moves faster than
-                                 # this (no glissando); commit once it settles
+# Speed-sensitive pitch glide (portamento). Move the finger SLOWLY and the pitch
+# slides smoothly from the starting note to the note you land on; move it FAST
+# and the pitch jumps straight there. GLIDE_JUMP_SPEED is the finger speed
+# (fraction of the frame travelled per video frame) at/above which the glide
+# becomes an instant jump; GLIDE_MIN_ALPHA sets how fast a slow-move glide
+# travels each frame (smaller = slower, more gradual slide).
+GLIDE_JUMP_SPEED = 0.06
+GLIDE_MIN_ALPHA = 0.15
 
 
 def white_range(low, high):
@@ -368,39 +374,58 @@ def split_hands(results):
 CAMERA_INDEX = None
 
 
-def open_camera():
-    """Open a webcam that delivers LIVE (non-black, non-frozen) frames.
+MIN_BRIGHTNESS = 50.0    # reject feeds dimmer than this mean (a covered/face-down
+                         # Continuity Camera reads ~30 with a max pixel near 45)
 
-    On macOS the first index is often a Continuity Camera (iPhone) that can
-    hand back a black OR a frozen/static image -- the usual cause of a black or
-    "strange static" window. So we warm up each index and only accept one whose
-    frames are both bright enough AND actually changing over time.
+
+def open_camera():
+    """Open a webcam that delivers a LIVE, BRIGHT (non-black, non-frozen) image.
+
+    On macOS index 0 is often a Continuity Camera (iPhone) that hands back a
+    black, frozen, or very dark image (e.g. lying face-down) -- the usual cause
+    of a black or "strange static" window. It can still show faint sensor noise,
+    so a first-acceptable scan wrongly grabs it. Instead we warm up EVERY index,
+    keep only feeds that are actually changing over time, and pick the BRIGHTEST
+    of those -- the real webcam pointed at a lit room wins over the dark iPhone.
     """
     indices = (CAMERA_INDEX,) if CAMERA_INDEX is not None else (0, 1, 2)
+    best = None                                   # (brightness, index, cap)
     for index in indices:
         cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
         if not cap.isOpened():
             cap.release()
             continue
-        nonblack = False
         motion = 0.0
+        brightness = 0.0
         prev = None
         for _ in range(40):                       # ~1.3s warm-up
             ok, frame = cap.read()
             if not ok or frame is None:
                 continue
-            if float(frame.std()) > 5.0:
-                nonblack = True
+            brightness = float(frame.mean())      # last settled frame's brightness
             if prev is not None:
                 motion = max(motion, float(np.mean(
                     np.abs(frame.astype(np.int16) - prev.astype(np.int16)))))
             prev = frame
-        if nonblack and motion > 0.4:             # live sensor noise/movement
-            print(f"Using camera index {index} (live).")
-            return cap
-        reason = "only black frames" if not nonblack else "a frozen/static image (no motion)"
-        print(f"Camera index {index}: {reason}; skipping.")
+        forced = CAMERA_INDEX is not None
+        live = motion > 0.4                        # live sensor noise/movement
+        if live and (brightness >= MIN_BRIGHTNESS or forced):
+            print(f"Camera index {index}: live, brightness {brightness:.0f}.")
+            if best is None or brightness > best[0]:
+                if best is not None:
+                    best[2].release()
+                best = (brightness, index, cap)
+                continue
+        else:
+            if not live:
+                reason = "black/frozen image (no motion)"
+            else:
+                reason = f"too dark (brightness {brightness:.0f} < {MIN_BRIGHTNESS:.0f}), likely a covered Continuity Camera"
+            print(f"Camera index {index}: {reason}; skipping.")
         cap.release()
+    if best is not None:
+        print(f"Using camera index {best[1]} (brightest live feed).")
+        return best[2]
     raise RuntimeError(
         "No camera delivered a LIVE image. Common macOS causes:\n"
         " - A Continuity Camera (iPhone) grabbed the camera and is showing a\n"
@@ -462,6 +487,7 @@ def main():
         committed_black = False
         chord_label = "single"
         prev_pt = None                           # last frame's fingertip (x, y)
+        glide_freq = committed_key["freq"]       # actually-sounding pitch (glides)
         tone.set_chord([committed_key["freq"]])
         current_note = committed_key["name"]
 
@@ -484,15 +510,19 @@ def main():
                 p = np.array([tip.x, tip.y])
                 speed = 0.0 if prev_pt is None else float(np.hypot(*(p - prev_pt)))
                 prev_pt = p
-                target_key, target_black = pick_key(tip.x, tip.y)
-                # Hold while moving fast (no glissando); commit once it settles.
-                if speed <= SETTLE_SPEED:
-                    committed_key, committed_black = target_key, target_black
-                    current_note = committed_key["name"]
+                committed_key, committed_black = pick_key(tip.x, tip.y)
+                current_note = committed_key["name"]
+                # Slide slowly -> smooth glide toward the pointed note; move fast
+                # -> jump to it. The per-frame glide rate (alpha) rises with finger
+                # speed, reaching 1.0 (instant jump) at GLIDE_JUMP_SPEED. We
+                # interpolate in log-frequency space so the sweep is musically even.
+                target_freq = committed_key["freq"]
+                alpha = float(np.clip(speed / GLIDE_JUMP_SPEED, GLIDE_MIN_ALPHA, 1.0))
+                glide_freq = math.exp(math.log(glide_freq)
+                                      + alpha * (math.log(target_freq) - math.log(glide_freq)))
                 offsets, chord_label = CHORDS.get(count_extended(pitch_hand.landmark),
                                                   ([0], "single"))
-                root = committed_key["freq"]
-                tone.set_chord([root * (SEMITONE ** o) for o in offsets])
+                tone.set_chord([glide_freq * (SEMITONE ** o) for o in offsets])
                 mp_drawing.draw_landmarks(
                     frame, pitch_hand, mp_hands.HAND_CONNECTIONS,
                     mp_styles.get_default_hand_landmarks_style(),
