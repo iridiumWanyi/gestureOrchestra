@@ -1,26 +1,36 @@
 """
 Two-handed gesture orchestra (theremin-style).
 
-A continuous orchestral tutti plays through your speakers, controlled by both
-hands at once:
+A continuous, rich orchestral tutti plays through your speakers, controlled by
+both hands at once:
     RIGHT index finger x -> pitch   (move left = lower, move right = higher)
     LEFT hand openness   -> volume  (fist = silent, spread = full)
 
 Run:
     ./venv/bin/python gesture_orchestra.py
 Press ESC in the video window to quit. Press 'c' to (re)calibrate the left
-hand's fist/open range to your own hand.
+hand's fist/open range to your own hand. Press 'b' to turn the black keys
+(semitones/sharps) on or off -- off gives a white-keys-only scale.
 
 Which hand is which
 -------------------
-We mirror the camera (selfie view), so your left hand appears on the left of
-the screen and MediaPipe's handedness labels match your real hands. If they
-come out swapped on your setup, flip SWAP_HANDS below.
+We mirror the camera (selfie view). HandRouter keeps right hand = pitch and
+left hand = volume by TRACKING each hand across frames (a hand barely moves
+between frames), so the left hand can never take over the pitch -- not when the
+hands cross, not when one drops out, and not when MediaPipe's flickery
+handedness label misfires for a frame. Labels are only used to classify a
+brand-new lone hand (with a several-frame vote before pitch is granted) and to
+heal a wrong seed after many consecutive disagreeing frames. If your setup
+comes out reversed, flip SWAP_HANDS below.
 
 How the controls are measured
 -----------------------------
-Pitch: the horizontal position (x) of the RIGHT index fingertip, snapped to
-the white-key scale G3..C5 -- far left = G3, far right = C5.
+Pitch: the horizontal position (x) of the RIGHT index fingertip over the scale
+G3..C5 (far left = G3, far right = C5). The fingertip's HEIGHT gates it. On the
+ruler line, a still finger holds the exact ("pure") note while a slow horizontal
+pan glides through the pitches in between (glissando). Drop below the line to
+travel silently in an arc to another note, then rise back to the line to sound
+that destination note cleanly. Only the right index finger affects the pitch.
 Volume: a scale-invariant openness ratio of the LEFT hand -- for the 4 long
 fingers, each fingertip's distance to its base knuckle, divided by palm size.
 Both are independent of how far the hand is from the camera.
@@ -37,6 +47,9 @@ import sounddevice as sd
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 mp_styles = mp.solutions.drawing_styles
+# Built once -- get_default_*_style() allocates a fresh spec dict on every call.
+LANDMARK_STYLE = mp_styles.get_default_hand_landmarks_style()
+CONNECTION_STYLE = mp_styles.get_default_hand_connections_style()
 
 # ---- Audio config -------------------------------------------------------
 SAMPLE_RATE = 44100
@@ -45,30 +58,30 @@ MAX_AMPLITUDE = 0.42     # overall loudness ceiling at 100% volume (soft)
 PITCH_MIN_HZ = 55.0      # keyboard pitch control clamps to this range
 PITCH_MAX_HZ = 2000.0
 SEMITONE = 2.0 ** (1.0 / 12.0)   # one-semitone frequency multiplier
-MAX_CHORD = 4            # max simultaneous chord tones
-CHORD_FADE_SEC = 0.03    # fade a chord tone in/out when the chord changes (no click)
 
-# ---- Timbre: soft, graceful string ensemble -----------------------------
-# A warm, gentle sound ("柔和优美") rather than a big tutti. We drop the harsh
-# extremes -- no contrabass rumble, no brass blare, no piccolo shrillness --
-# and keep warm strings around the played note with just a little octave
-# colour. Each section is a pool of independent players (own detuning, vibrato
-# rate/phase and harmonic phases), so they bloom into a soft, breathing
-# ensemble. Warm (low) rolloff values keep the highs mellow. Voices are panned
-# across stereo for width; it all renders live so pitch/volume stay instant.
+# ---- Timbre: warm, full string orchestra --------------------------------
+# A rich but SOFT string orchestra ("浑厚丰富但柔和") -- no brass, no piercing
+# highs. The body comes from stacking many string sections across octaves, from
+# a deep contrabass foundation up through cellos, violas and violins, so it
+# stays full and powerful without any harsh edge. Each section is a pool of
+# independent players (own detuning, vibrato rate/phase and harmonic phases);
+# with many voices per section they melt into a broad, breathing string tutti.
+# The LOW rolloff values keep every voice close to a mellow sine with only a
+# gentle overtone bloom -- warm, never bright or edgy. Voices are panned across
+# stereo for orchestral width; it all renders live so pitch/volume stay instant.
 N_HARMONICS = 16
 HARMONIC_K = np.arange(1, N_HARMONICS + 1)
 ANTIALIAS_HZ = 0.45 * SAMPLE_RATE           # drop harmonics above this (no aliasing)
 
 # Each section: (octave multiplier, brightness rolloff, n_voices, gain/voice).
-# Bigger rolloff = brighter; lower octave = deeper. Low rolloffs here keep the
-# tone soft and warm rather than edgy.
-# (Lighter than the single-note version: chords render this ensemble PER note,
-# so we keep the voice count modest to stay well within the audio-time budget.)
+# Bigger rolloff = brighter; lower octave = deeper. These rolloffs are kept LOW
+# (soft, string-like) so nothing gets harsh; the fullness comes from the octave
+# spread (0.25x .. 2x) and the large voice count, not from bright harmonics.
 SECTIONS = [
-    (0.5,  4.0, 1, 0.45),    # soft lower octave (cello-ish)  -> gentle warmth
-    (1.0,  5.5, 5, 0.70),    # warm strings (unison)          -> mellow body
-    (2.0,  5.0, 1, 0.22),    # soft octave up                 -> airy sheen
+    (0.25, 2.0, 1, 0.30),    # contrabasses         -> deep, round foundation
+    (0.5,  2.6, 3, 0.52),    # cellos & basses       -> warm lower body
+    (1.0,  3.2, 7, 0.74),    # violas & violins (core) -> full, soft mid weight
+    (2.0,  2.8, 4, 0.40),    # upper strings         -> gentle warmth, not piercing
 ]
 
 # Expand sections into flat per-voice arrays.
@@ -83,13 +96,13 @@ N_VOICES = len(VOICE_OCTAVES)
 # Per-voice harmonic amplitude profile (1/k overtones with the section rolloff).
 HARM_A = np.array([(1.0 / HARMONIC_K) * np.exp(-(HARMONIC_K - 1) / r) for r in _roll])
 
-DETUNE_SPREAD_CENTS = 6.0                   # std-dev of random per-voice detune
-VIB_RATE_RANGE = (4.5, 6.0)                 # gentle vibrato speed (Hz)
-VIB_DEPTH_RANGE = (0.003, 0.006)            # gentle vibrato depth
+DETUNE_SPREAD_CENTS = 10.0                  # std-dev of random per-voice detune (big ensemble)
+VIB_RATE_RANGE = (4.5, 6.0)                 # orchestral string vibrato speed (Hz)
+VIB_DEPTH_RANGE = (0.004, 0.007)            # gentle vibrato depth
 
 # Make-up gain after normalization; tuned so the worst-case peak across all
 # notes stays clear of clipping (verified by a sweep).
-_TIMBRE_GAIN = 4.5
+_TIMBRE_GAIN = 5.8
 _TIMBRE_NORM = _TIMBRE_GAIN / (HARM_A.sum(axis=1) * VOICE_GAINS).sum()
 
 _NOTE_SEMITONE = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
@@ -109,24 +122,41 @@ def note_to_freq(note):
 # ---- Two-row pitch: white keys (lower line) + black keys (upper line) ----
 # The RIGHT index finger's HORIZONTAL position picks the note; its VERTICAL
 # position picks the ROW -- raise it to the upper line for black keys (sharps),
-# lower it for the white keys. Range C3..C5.
+# lower it for the white keys. Range G3..C5.
 SWAP_HANDS = False               # set True if your left/right come out swapped
 INDEX_TIP = 8                    # MediaPipe landmark: index fingertip
 _WHITE = ["C", "D", "E", "F", "G", "A", "B"]
 
-PITCH_X_LEFT = 0.05              # note zone: far left  = C3
-PITCH_X_RIGHT = 0.95            #            far right = C5
-RULER_Y_BLACK = 0.30             # upper line (black keys / sharps)
-RULER_Y_WHITE = 0.45             # lower line (white keys / naturals)
-ROW_SPLIT_Y = 0.375              # finger y above this -> black row, below -> white
-# Speed-sensitive pitch glide (portamento). Move the finger SLOWLY and the pitch
-# slides smoothly from the starting note to the note you land on; move it FAST
-# and the pitch jumps straight there. GLIDE_JUMP_SPEED is the finger speed
-# (fraction of the frame travelled per video frame) at/above which the glide
-# becomes an instant jump; GLIDE_MIN_ALPHA sets how fast a slow-move glide
-# travels each frame (smaller = slower, more gradual slide).
-GLIDE_JUMP_SPEED = 0.06
-GLIDE_MIN_ALPHA = 0.15
+PITCH_X_LEFT = 0.10              # note zone: far left  = G3 (kept off the frame
+PITCH_X_RIGHT = 0.90            #            far right = C5  edges, where hand
+                                #            tracking is least accurate)
+RULER_Y_BLACK = 0.57             # upper line (black keys / sharps), lower part of frame
+RULER_Y_WHITE = 0.72             # lower line (white keys / naturals), toward the bottom
+ROW_SPLIT_Y = 0.645              # finger y above this -> black row, below -> white
+# Height-gated pitch, driven ONLY by the RIGHT index fingertip.
+#   - Below the ruler line (DISENGAGED): the pitch FREEZES, so you can arc down
+#     and swing across to another note silently -- nothing in between sounds.
+#   - On/above the line (ENGAGED): whether you hear a glissando depends on the
+#     fingertip's HORIZONTAL motion:
+#       * arriving from below, or holding still -> snap to and HOLD the exact
+#         note: a clean, in-tune "pure" tone (this also hides fingertip jitter);
+#       * panning slowly along the line -> glide continuously through the
+#         pitches in between (a glissando).
+# So: return to the line -> a pure note; slow pan on the line -> a glissando.
+# Hysteresis (ENGAGE_Y..DISENGAGE_Y) keeps engage/disengage from flickering.
+# glide = 0 when the horizontal speed |dx| <= MOVE_LO (still), rising to 1 at
+# MOVE_HI (panning); it blends the snapped note and the continuous pitch.
+# MOVE_SMOOTH smooths the speed reading; OUT_SMOOTH is a click-free glide on the
+# result.
+ENGAGE_Y = RULER_Y_WHITE + 0.03      # rise to here (or above) -> engaged (on the line)
+DISENGAGE_Y = RULER_Y_WHITE + 0.08   # drop below here -> disengaged (silent travel)
+MOVE_LO = 0.0025                     # |dx|/frame at/below this = still -> pure note
+MOVE_HI = 0.0060                     # at/above this = panning -> glissando
+MOVE_SMOOTH = 0.5                    # EMA on the horizontal-speed reading
+OUT_SMOOTH = 0.5
+POS_SMOOTH = 0.6                 # fingertip-position EMA (1 = none). Tames landmark
+                                 # jitter for steadier, more precise notes; kept high
+                                 # so it adds well under a frame of lag.
 
 
 def white_range(low, high):
@@ -143,8 +173,8 @@ def white_range(low, high):
 
 
 def build_keys():
-    """White row C3..C5 (evenly spaced) + black row (sharps at white midpoints)."""
-    names = white_range("C3", "C5")
+    """White row G3..C5 (evenly spaced) + black row (sharps at white midpoints)."""
+    names = white_range("G3", "C5")
     nW = len(names)
     white = [{"name": n, "freq": note_to_freq(n),
               "x": PITCH_X_LEFT + k / (nW - 1) * (PITCH_X_RIGHT - PITCH_X_LEFT)}
@@ -161,33 +191,26 @@ def build_keys():
 WHITE_KEYS, BLACK_KEYS = build_keys()
 
 
-def pick_key(fx, fy):
-    """Nearest key to finger x, in the row chosen by finger y (up = black)."""
-    row = BLACK_KEYS if fy < ROW_SPLIT_Y else WHITE_KEYS
+def pick_key(fx, fy, allow_black=True):
+    """Nearest key to finger x, in the row chosen by finger y (up = black).
+
+    With allow_black False the black (sharp) row is disabled: white keys only,
+    regardless of finger height."""
+    row = BLACK_KEYS if (allow_black and fy < ROW_SPLIT_Y) else WHITE_KEYS
     best = min(row, key=lambda k: abs(k["x"] - fx))
     return best, (row is BLACK_KEYS)
 
 
-# ---- Chords: right-hand finger count -> chord built on the pointed note ---
-# Value = (semitone offsets from the pointed root note, label). Index only = 1
-# finger = single note; each extra finger adds a richer chord.
-CHORDS = {
-    1: ([0], "single"),
-    2: ([0, 4, 7], "major"),
-    3: ([0, 3, 7], "minor"),
-    4: ([0, 4, 7, 10], "dom7"),
-}
-# (tip, pip) for the four long fingers -- extended if the tip is farther from
-# the wrist than its middle joint (works regardless of hand orientation).
-_EXT_FINGERS = [(8, 6), (12, 10), (16, 14), (20, 18)]
-
-
-def count_extended(landmarks):
-    """How many of index/middle/ring/pinky are extended (0..4)."""
-    w = landmarks[0]
-    def far(i):
-        return math.hypot(landmarks[i].x - w.x, landmarks[i].y - w.y)
-    return sum(1 for tip, pip in _EXT_FINGERS if far(tip) > far(pip))
+def continuous_freq(fx):
+    """Un-snapped pitch at finger x, log-interpolated between the two neighbouring
+    white keys -- the continuous target a glissando sweep follows."""
+    n = len(WHITE_KEYS)
+    span = PITCH_X_RIGHT - PITCH_X_LEFT
+    pos = (float(np.clip(fx, PITCH_X_LEFT, PITCH_X_RIGHT)) - PITCH_X_LEFT) / span * (n - 1)
+    i = min(int(pos), n - 2)
+    t = pos - i
+    lo, hi = WHITE_KEYS[i]["freq"], WHITE_KEYS[i + 1]["freq"]
+    return math.exp((1.0 - t) * math.log(lo) + t * math.log(hi))
 
 
 # ---- Openness -> volume calibration ------------------------------------
@@ -202,19 +225,29 @@ SMOOTHING = 0.25         # 0..1, lower = smoother/slower volume changes
 FINGERS = [(8, 5), (12, 9), (16, 13), (20, 17)]
 
 
+TABLE_SIZE = 4096        # wavetable resolution; interp error at 16 harmonics is ~-80 dB
+
+
 class TonePlayer:
-    """Polyphonic soft-ensemble synth. Plays up to MAX_CHORD notes at once, each
-    rendered with the full ensemble; chord tones fade in/out click-free."""
+    """Rich orchestral-tutti synth playing one continuous note. Set its frequency
+    and volume from the video thread; the audio callback renders the full
+    ensemble live and keeps every voice's phase continuous so pitch changes stay
+    click-free.
+
+    Rendering is wavetable-based for speed: each voice's waveform (its harmonic
+    stack) is a fixed periodic function, so it is precomputed ONCE into a table
+    and the callback just looks it up at the running phase (linear interp),
+    vectorized across all voices. That replaces ~250k np.sin calls per block
+    with one table gather -- far less CPU and far less GIL time stolen from the
+    video loop. Anti-aliasing is preserved exactly: tables are cumulative per
+    harmonic count, and each voice picks the table with only its harmonics that
+    fall below ANTIALIAS_HZ at the current pitch."""
 
     def __init__(self, sample_rate=SAMPLE_RATE, freq=TONE_HZ):
         self.sample_rate = sample_rate
         self._target_vol = 0.0
         self._cur_vol = 0.0
-        # Chord state: one frequency + fade-gain target per slot.
-        self._chord_freqs = np.full(MAX_CHORD, freq, dtype=float)
-        self._slot_target = np.zeros(MAX_CHORD)   # 1 = slot in use, 0 = fading out
-        self._slot_target[0] = 1.0
-        self._slot_gain = np.zeros(MAX_CHORD)     # smoothed, advanced in callback
+        self._freq = float(freq)
         self._lock = threading.Lock()
 
         # Fixed random character per ensemble voice (seeded for a stable timbre).
@@ -226,12 +259,27 @@ class TonePlayer:
         pos = np.linspace(0.0, 1.0, N_VOICES)
         rng.shuffle(pos)
         theta = pos * (np.pi / 2.0)
-        self._pan_l = np.cos(theta)
-        self._pan_r = np.sin(theta)
+        self._pan_l = np.cos(theta).astype(np.float32)
+        self._pan_r = np.sin(theta).astype(np.float32)
+        self._gains32 = VOICE_GAINS.astype(np.float32)
 
-        # Phase state per (chord slot, voice), so each note stays click-free.
-        self._phases = rng.uniform(0.0, 2.0 * np.pi, size=(MAX_CHORD, N_VOICES))
-        self._vib_phases = rng.uniform(0.0, 2.0 * np.pi, size=(MAX_CHORD, N_VOICES))
+        # Cumulative wavetables: tables[v, n] = voice v's waveform built from its
+        # first n harmonics, so the antialias cutoff can drop high harmonics by
+        # just picking a lower n -- same result as masking them, no recompute.
+        x = np.arange(TABLE_SIZE) * (2.0 * np.pi / TABLE_SIZE)
+        tables = np.zeros((N_VOICES, N_HARMONICS + 1, TABLE_SIZE), dtype=np.float32)
+        for v in range(N_VOICES):
+            acc = np.zeros(TABLE_SIZE)
+            for k in range(N_HARMONICS):
+                acc = acc + HARM_A[v, k] * np.sin((k + 1) * x + self._harm_off[v, k])
+                tables[v, k + 1] = acc
+        self._tables = tables
+        self._n_ok = None             # harmonics-under-cutoff per voice (cached)
+        self._vt = None               # the (V, TABLE_SIZE) tables selected by _n_ok
+
+        # Per-voice phase state, so the note stays click-free across callbacks.
+        self._phases = rng.uniform(0.0, 2.0 * np.pi, size=N_VOICES)
+        self._vib_phases = rng.uniform(0.0, 2.0 * np.pi, size=N_VOICES)
 
         self.stream = sd.OutputStream(
             samplerate=sample_rate, channels=2,
@@ -241,76 +289,60 @@ class TonePlayer:
         with self._lock:
             self._target_vol = float(np.clip(vol, 0.0, 1.0))
 
-    def set_chord(self, freqs):
-        """Set the sounding notes (list of frequencies, 1..MAX_CHORD)."""
-        with self._lock:
-            n = max(1, min(len(freqs), MAX_CHORD))
-            for i in range(n):
-                self._chord_freqs[i] = float(np.clip(freqs[i], PITCH_MIN_HZ, PITCH_MAX_HZ))
-                self._slot_target[i] = 1.0
-            for i in range(n, MAX_CHORD):
-                self._slot_target[i] = 0.0        # fade out (keep last freq -> no click)
-
     def set_freq(self, freq):
-        self.set_chord([freq])
+        with self._lock:
+            self._freq = float(np.clip(freq, PITCH_MIN_HZ, PITCH_MAX_HZ))
 
     @property
     def freq(self):
         with self._lock:
-            return float(self._chord_freqs[0])
-
-    def _render_note(self, slot, freq, frames, idx, two_pi, sr):
-        left = np.zeros(frames)
-        right = np.zeros(frames)
-        for v in range(N_VOICES):
-            vib = 1.0 + self._vib_depth[v] * np.sin(
-                self._vib_phases[slot, v] + two_pi * self._vib_rate[v] * idx / sr)
-            self._vib_phases[slot, v] = float(
-                (self._vib_phases[slot, v] + two_pi * self._vib_rate[v] * frames / sr) % two_pi)
-            inst = freq * VOICE_OCTAVES[v] * self._detune[v] * vib
-            phase = self._phases[slot, v] + np.cumsum(two_pi * inst / sr)
-            self._phases[slot, v] = float(phase[-1] % two_pi)
-            a_v = HARM_A[v] * (HARMONIC_K * freq * VOICE_OCTAVES[v] < ANTIALIAS_HZ)
-            harm = np.sin(phase[:, None] * HARMONIC_K[None, :] + self._harm_off[v][None, :])
-            voice = (harm @ a_v) * VOICE_GAINS[v]
-            left += voice * self._pan_l[v]
-            right += voice * self._pan_r[v]
-        return left * _TIMBRE_NORM, right * _TIMBRE_NORM
+            return self._freq
 
     def _callback(self, outdata, frames, time_info, status):
         with self._lock:
             target_vol = self._target_vol
-            chord_freqs = self._chord_freqs.copy()
-            slot_target = self._slot_target.copy()
+            freq = self._freq
 
         sr = self.sample_rate
-        idx = np.arange(frames)
         two_pi = 2.0 * math.pi
-        fade_step = frames / (CHORD_FADE_SEC * sr)
+        t = np.arange(frames)
 
-        left = np.zeros(frames)
-        right = np.zeros(frames)
-        active_gain = 0.0
-        for s in range(MAX_CHORD):
-            g0 = self._slot_gain[s]
-            g1 = g0 + float(np.clip(slot_target[s] - g0, -fade_step, fade_step))
-            self._slot_gain[s] = g1
-            if g0 <= 1e-4 and g1 <= 1e-4:
-                continue                          # silent slot -> skip (phases frozen)
-            l, r = self._render_note(s, chord_freqs[s], frames, idx, two_pi, sr)
-            gain = np.linspace(g0, g1, frames)
-            left += l * gain
-            right += r * gain
-            active_gain += g1
+        # Vibrato and phase accumulation for ALL voices at once (V, frames).
+        vib = 1.0 + self._vib_depth[:, None] * np.sin(
+            self._vib_phases[:, None] + (two_pi / sr) * self._vib_rate[:, None] * t)
+        self._vib_phases = (self._vib_phases + two_pi * self._vib_rate * frames / sr) % two_pi
+        inst = (freq * VOICE_OCTAVES * self._detune)[:, None] * vib
+        phase = self._phases[:, None] + np.cumsum((two_pi / sr) * inst, axis=1)
+        self._phases = phase[:, -1] % two_pi
 
-        # Normalize by how many notes are sounding so a chord isn't louder than
-        # a single note, then ramp master volume per sample.
-        norm = 1.0 / math.sqrt(max(1.0, active_gain))
-        amp = np.linspace(self._cur_vol, target_vol, frames) * norm
+        # Pick each voice's table for the harmonics under the antialias cutoff
+        # (the cutoff mask is a prefix of k, so a count selects the same set).
+        n_ok = (HARMONIC_K[None, :] * (freq * VOICE_OCTAVES)[:, None]
+                < ANTIALIAS_HZ).sum(axis=1)
+        if self._n_ok is None or not np.array_equal(n_ok, self._n_ok):
+            self._n_ok = n_ok
+            self._vt = self._tables[np.arange(N_VOICES), n_ok]
+
+        # Wavetable lookup with linear interpolation (phase is always >= 0).
+        pos = phase * (TABLE_SIZE / two_pi)
+        ip = pos.astype(np.int64)
+        frac = (pos - ip).astype(np.float32)
+        i0 = ip % TABLE_SIZE
+        i1 = (ip + 1) % TABLE_SIZE
+        w0 = np.take_along_axis(self._vt, i0, axis=1)
+        w1 = np.take_along_axis(self._vt, i1, axis=1)
+        sig = (w0 + frac * (w1 - w0)) * self._gains32[:, None]
+
+        left = self._pan_l @ sig
+        right = self._pan_r @ sig
+
+        # Ramp master volume per sample (no click when the volume jumps).
+        amp = np.linspace(self._cur_vol, target_vol, frames,
+                          dtype=np.float32) * np.float32(_TIMBRE_NORM * MAX_AMPLITUDE)
         self._cur_vol = target_vol
 
-        outdata[:, 0] = np.clip(left * amp * MAX_AMPLITUDE, -1.0, 1.0).astype(np.float32)
-        outdata[:, 1] = np.clip(right * amp * MAX_AMPLITUDE, -1.0, 1.0).astype(np.float32)
+        outdata[:, 0] = np.clip(left * amp, -1.0, 1.0)
+        outdata[:, 1] = np.clip(right * amp, -1.0, 1.0)
 
     def __enter__(self):
         self.stream.start()
@@ -340,38 +372,147 @@ def ratio_to_volume(ratio, lo, hi):
     return float(np.clip((ratio - lo) / (hi - lo), 0.0, 1.0))
 
 
-_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+def _index_tip(lms):
+    t = lms.landmark[INDEX_TIP]
+    return np.array([t.x, t.y])
 
 
-def freq_to_note_name(freq):
-    """Nearest note name like 'A4' for a frequency (for the HUD)."""
-    midi = round(69 + 12 * math.log2(freq / 440.0))
-    return f"{_NAMES[midi % 12]}{midi // 12 - 1}"
+TRACK_MATCH_DIST = 0.25   # max wrist jump (normalized) to count as the same hand
+TRACK_MAX_AGE = 10        # frames a lost hand's track stays valid for re-matching
+SOLO_PITCH_VOTES = 3      # consistent right-hand labels a lone NEW hand needs for pitch
+SWAP_HEAL_FRAMES = 10     # frames of steady label disagreement before roles swap
 
 
-def split_hands(results):
-    """Return (pitch_hand, volume_hand) landmark objects, or None for each.
+def _wrist(lms):
+    w = lms.landmark[0]
+    return np.array([w.x, w.y])
 
-    Right hand -> pitch, left hand -> volume. We mirror the camera, so
-    MediaPipe's handedness matches the user's real hands (flip SWAP_HANDS if
-    not). If only one hand is seen it is assigned by its label.
-    """
-    pitch_hand = volume_hand = None
-    if results.multi_hand_landmarks and results.multi_handedness:
-        for lms, handed in zip(results.multi_hand_landmarks, results.multi_handedness):
-            label = handed.classification[0].label          # 'Left' or 'Right'
-            if SWAP_HANDS:
-                label = "Right" if label == "Left" else "Left"
-            if label == "Right":
-                pitch_hand = lms
+
+class HandRouter:
+    """Assigns hands to the pitch (physical RIGHT) and volume (physical LEFT)
+    roles so the LEFT hand can NEVER move the pitch.
+
+    Identity comes from CONTINUITY: a hand barely moves between frames, so each
+    role tracks its wrist position and every new frame is matched to the nearest
+    track. MediaPipe's handedness label is never trusted per frame (it flickers,
+    and a single mislabeled frame must not hand the pitch to the left hand); it
+    is only used (a) to decide what a brand-new lone hand is -- and then a lone
+    hand must vote 'right' several frames in a row before it is GRANTED pitch,
+    while one 'left' vote immediately makes it volume (erring on the safe side)
+    -- and (b) as a slow healer: if, with both hands visible, the labels
+    consistently contradict the current assignment for many consecutive frames,
+    the roles swap once. The label->hand mapping itself is learned from the
+    unambiguous two-hand case (right-most on the mirrored screen = physical
+    right). SWAP_HANDS inverts the roles."""
+
+    def __init__(self):
+        self._label_bias = 0.0    # >0: MediaPipe's 'Right' label = physical right hand
+        self._tracks = {"pitch": None, "vol": None}    # role -> [wrist_pos, age]
+        self._solo_vote = 0.0     # lone-new-hand handedness evidence
+        self._swap_evid = 0       # steady-disagreement counter (role healing)
+
+    def _fresh(self, role):
+        t = self._tracks[role]
+        return t is not None and t[1] <= TRACK_MAX_AGE
+
+    def _is_right_label(self, label):
+        right = "Right" if self._label_bias >= 0.0 else "Left"
+        if SWAP_HANDS:
+            right = "Left" if right == "Right" else "Right"
+        return label == right
+
+    def route(self, results):
+        """Return (pitch_hand, volume_hand); either may be None. Pitch is only ever
+        the tracked physical right hand -- never the left one."""
+        for t in self._tracks.values():
+            if t is not None:
+                t[1] += 1
+        lms = results.multi_hand_landmarks
+        handed = results.multi_handedness
+        if not lms or not handed:
+            self._solo_vote = 0.0
+            return None, None
+        hands = [(l, h.classification[0].label) for l, h in zip(lms, handed)]
+
+        if len(hands) >= 2:
+            (h0, lab0), (h1, lab1) = hands[0], hands[1]
+            p0, p1 = _wrist(h0), _wrist(h1)
+            # Learn the label mapping only when it is unambiguous: hands clearly
+            # apart and labelled differently (right-most = physical right).
+            if abs(p0[0] - p1[0]) > 0.15 and lab0 != lab1:
+                right_lab = lab0 if p0[0] > p1[0] else lab1
+                self._label_bias += 0.15 * ((1.0 if right_lab == "Right" else -1.0)
+                                            - self._label_bias)
+            if self._fresh("pitch") and self._fresh("vol"):
+                # Both roles tracked -> pure continuity (handles crossing; immune
+                # to label flicker).
+                pp, vp = self._tracks["pitch"][0], self._tracks["vol"][0]
+                keep = (np.linalg.norm(p0 - pp) + np.linalg.norm(p1 - vp)
+                        <= np.linalg.norm(p1 - pp) + np.linalg.norm(p0 - vp))
+            elif lab0 != lab1:
+                # (Re)seeding with informative labels -> the right-labelled hand.
+                keep = self._is_right_label(lab0)
             else:
-                volume_hand = lms
-    return pitch_hand, volume_hand
+                # Same label on both -> seed by screen side (right-most = pitch).
+                keep = p0[0] >= p1[0]
+                if SWAP_HANDS:
+                    keep = not keep
+            pitch_hand, pitch_lab = (h0, lab0) if keep else (h1, lab1)
+            volume_hand, vol_lab = (h1, lab1) if keep else (h0, lab0)
+
+            # Healing: if the labels steadily contradict this assignment, a seed
+            # went wrong (e.g. a hand re-entered on the far side) -- swap ONCE
+            # after SWAP_HEAL_FRAMES consecutive disagreeing frames. Transient
+            # label flicker never gets that far.
+            if pitch_lab != vol_lab:
+                if self._is_right_label(pitch_lab):
+                    self._swap_evid = 0
+                else:
+                    self._swap_evid += 1
+                    if self._swap_evid >= SWAP_HEAL_FRAMES:
+                        pitch_hand, volume_hand = volume_hand, pitch_hand
+                        self._swap_evid = 0
+            self._tracks["pitch"] = [_wrist(pitch_hand), 0]
+            self._tracks["vol"] = [_wrist(volume_hand), 0]
+            self._solo_vote = 0.0
+            return pitch_hand, volume_hand
+
+        # --- one hand visible ---
+        h, lab = hands[0]
+        p = _wrist(h)
+        d_pitch = (np.linalg.norm(p - self._tracks["pitch"][0])
+                   if self._fresh("pitch") else np.inf)
+        d_vol = (np.linalg.norm(p - self._tracks["vol"][0])
+                 if self._fresh("vol") else np.inf)
+        if min(d_pitch, d_vol) <= TRACK_MATCH_DIST:
+            # Continues a tracked hand -> keep its role, whatever the label says.
+            role = "pitch" if d_pitch <= d_vol else "vol"
+            self._tracks[role] = [p, 0]
+            return (h, None) if role == "pitch" else (None, h)
+        # A brand-new lone hand: vote on its handedness. Pitch needs several
+        # consistent right-hand labels; a single left-hand label makes it volume
+        # (the safe direction -- the left hand must never take the pitch).
+        self._solo_vote += 1.0 if self._is_right_label(lab) else -1.0
+        if self._solo_vote >= SOLO_PITCH_VOTES:
+            self._tracks["pitch"] = [p, 0]
+            self._solo_vote = 0.0
+            return h, None
+        if self._solo_vote <= -1.0:
+            self._tracks["vol"] = [p, 0]
+            self._solo_vote = 0.0
+            return None, h
+        return None, None            # undecided for a frame or two -> hold as-is
 
 
 # Camera index. None = auto-detect the first camera that delivers live
 # frames (skips a black/frozen Continuity Camera). Set an int to force one.
 CAMERA_INDEX = None
+
+# Capture and processing sizes. We grab 720p (lighter to read/draw than 1080p)
+# and run hand detection on a downscaled copy -- landmarks are normalized, so
+# the display stays full-res while detection gets faster and lower-latency.
+CAPTURE_WIDTH, CAPTURE_HEIGHT = 1280, 720
+PROC_WIDTH = 640
 
 
 MIN_BRIGHTNESS = 50.0    # reject feeds dimmer than this mean (a covered/face-down
@@ -438,6 +579,16 @@ def open_camera():
     )
 
 
+_TEXT_W = {}             # (label, font_scale) -> pixel width, cached across frames
+
+
+def _text_width(label, fs):
+    key = (label, fs)
+    if key not in _TEXT_W:
+        _TEXT_W[key] = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs, 2)[0][0]
+    return _TEXT_W[key]
+
+
 def _draw_ruler_row(frame, keys, y_frac, active_key, is_active_row, finger_x):
     h, w, _ = frame.shape
     y = int(h * y_frac)
@@ -451,7 +602,7 @@ def _draw_ruler_row(frame, keys, y_frac, active_key, is_active_row, finger_x):
         tick = 20 if active else 12
         cv2.line(frame, (x, y - tick), (x, y + tick), color, 4 if active else 2)
         fs = 0.7 if active else 0.5
-        (tw, _th), _ = cv2.getTextSize(key["name"], cv2.FONT_HERSHEY_SIMPLEX, fs, 2)
+        tw = _text_width(key["name"], fs)
         cv2.putText(frame, key["name"], (x - tw // 2, y - tick - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, fs, color, 2, cv2.LINE_AA)
         if active:
@@ -461,112 +612,182 @@ def _draw_ruler_row(frame, keys, y_frac, active_key, is_active_row, finger_x):
         cv2.drawMarker(frame, (fx, y + 24), (0, 0, 255), cv2.MARKER_TRIANGLE_UP, 24, 3)
 
 
-def draw_pitch_ruler(frame, active_key, is_black, finger_x=None):
+def draw_pitch_ruler(frame, active_key, is_black, finger_x=None, show_black=True):
     """Two rows: upper line = black keys (sharps), lower = white keys. The active
-    row (chosen by the finger's height) is bright; the current note highlighted."""
-    _draw_ruler_row(frame, BLACK_KEYS, RULER_Y_BLACK,
-                    active_key if is_black else None, is_black,
-                    finger_x if is_black else None)
+    row (chosen by the finger's height) is bright; the current note highlighted.
+    With show_black False only the white row is drawn (semitones disabled)."""
+    if show_black:
+        _draw_ruler_row(frame, BLACK_KEYS, RULER_Y_BLACK,
+                        active_key if is_black else None, is_black,
+                        finger_x if is_black else None)
     _draw_ruler_row(frame, WHITE_KEYS, RULER_Y_WHITE,
                     None if is_black else active_key, not is_black,
                     None if is_black else finger_x)
 
 
-def main():
-    lo, hi = OPEN_RATIO_FIST, OPEN_RATIO_OPEN
-    cap = open_camera()
+WINDOW = "Gesture Orchestra - ESC quit, c calibrate"
 
-    with TonePlayer() as tone, mp_hands.Hands(
+
+def detect_hands(hands, frame_bgr):
+    """Run MediaPipe on a downscaled RGB copy of the frame. Landmarks are
+    normalized (size-independent), so the full-res frame is still what we draw.
+    Downscale FIRST so the colour conversion only touches 1/4 of the pixels."""
+    if frame_bgr.shape[1] > PROC_WIDTH:
+        h = round(frame_bgr.shape[0] * PROC_WIDTH / frame_bgr.shape[1])
+        frame_bgr = cv2.resize(frame_bgr, (PROC_WIDTH, h))
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    rgb.flags.writeable = False
+    return hands.process(rgb)
+
+
+class VolumeControl:
+    """Maps the LEFT hand's openness (fist..spread) to a smoothed volume 0..1."""
+
+    def __init__(self, lo=OPEN_RATIO_FIST, hi=OPEN_RATIO_OPEN):
+        self.lo, self.hi = lo, hi
+        self.value = 0.0
+
+    def update(self, volume_hand):
+        target = 0.0
+        if volume_hand is not None:
+            target = ratio_to_volume(hand_openness(volume_hand.landmark), self.lo, self.hi)
+        self.value += SMOOTHING * (target - self.value)
+        return self.value
+
+
+class PitchControl:
+    """Maps the RIGHT index fingertip to a pitch. Vertical position gates it (with
+    hysteresis): below the ruler line the pitch FREEZES (silent travel -- arc
+    across notes without sounding them); on/above the line a still finger holds
+    the exact "pure" note while a slow horizontal pan glides through the pitches
+    in between (glissando), and returning to the line always re-sounds the exact
+    note. Only the fingertip's x/y are read, so nothing else -- not the other
+    fingers, not the left hand -- can move the pitch."""
+
+    def __init__(self):
+        mid = WHITE_KEYS[len(WHITE_KEYS) // 2]
+        self.key = mid                # note the ruler points at (held while travelling)
+        self.is_black = False
+        self.freq = mid["freq"]       # actually-sounding pitch
+        self.engaged = False
+        self.finger_x = None          # smoothed fingertip x/y (None when no pitch hand)
+        self.finger_y = None
+        self._tip = None              # EMA-smoothed (x, y)
+        self._prev_engaged = False
+        self._prev_x = None
+        self._dx = 0.0                # smoothed horizontal speed (still vs. panning)
+
+    def update(self, pitch_hand, semitones_on):
+        """Advance one frame; refreshes freq / key / engaged / finger_x / finger_y."""
+        if pitch_hand is None:
+            self._tip = self._prev_x = None
+            self._dx = 0.0
+            self.engaged = self._prev_engaged = False
+            self.finger_x = self.finger_y = None
+            return                    # hold the last freq
+
+        # Smooth the fingertip to tame per-frame landmark jitter.
+        raw = _index_tip(pitch_hand)
+        self._tip = raw if self._tip is None else self._tip + POS_SMOOTH * (raw - self._tip)
+        sx, sy = float(self._tip[0]), float(self._tip[1])
+        self.finger_x, self.finger_y = sx, sy
+
+        # Engage / disengage by finger height, with hysteresis.
+        if self.engaged and sy > DISENGAGE_Y:
+            self.engaged = False
+        elif not self.engaged and sy < ENGAGE_Y:
+            self.engaged = True
+
+        if self.engaged:
+            self.key, self.is_black = pick_key(sx, sy, allow_black=semitones_on)
+            snap = self.key["freq"]
+            if not self._prev_engaged or self._prev_x is None:
+                # Returned to the line -> sound the exact note (the arc here was silent).
+                self.freq = snap
+                self._dx = 0.0
+            else:
+                # Still -> hold the pure note; panning -> glissando between notes.
+                self._dx += MOVE_SMOOTH * (abs(sx - self._prev_x) - self._dx)
+                glide = float(np.clip((self._dx - MOVE_LO) / (MOVE_HI - MOVE_LO), 0.0, 1.0))
+                cont = snap if self.is_black else continuous_freq(sx)
+                target = math.exp((1.0 - glide) * math.log(snap) + glide * math.log(cont))
+                self.freq = math.exp(math.log(self.freq)
+                                     + OUT_SMOOTH * (math.log(target) - math.log(self.freq)))
+        # else: disengaged -> hold self.freq (silent travel between notes).
+        self._prev_x = sx
+        self._prev_engaged = self.engaged
+
+
+def draw_hud(frame, pitch, volume, semitones_on):
+    """Draw the fingertip marker, note ruler, volume bar and text overlays."""
+    h, w, _ = frame.shape
+    # Fingertip marker: cyan on the line, orange while travelling below it.
+    if pitch.finger_x is not None:
+        dot = (0, 255, 255) if pitch.engaged else (0, 140, 255)
+        cv2.circle(frame, (int(pitch.finger_x * w), int(pitch.finger_y * h)), 10, dot, 2)
+    # Note ruler (white row; black row too when semitones are on).
+    draw_pitch_ruler(frame, pitch.key, pitch.is_black, pitch.finger_x, show_black=semitones_on)
+    # Volume bar.
+    pct = int(round(volume * 100))
+    bar_w = int(volume * (w - 40))
+    cv2.rectangle(frame, (20, h - 50), (w - 20, h - 20), (60, 60, 60), 2)
+    cv2.rectangle(frame, (20, h - 50), (20 + bar_w, h - 20), (0, 255, 0), cv2.FILLED)
+    # Text.
+    semi = "on" if semitones_on else "off"
+    state = "" if pitch.engaged else "  (travel)"
+    cv2.putText(frame, f"Note: {pitch.key['name']}{state}   Semitones: {semi}   Volume: {pct}%",
+                (20, h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    row_hint = "up=black/down=white  " if semitones_on else ""
+    cv2.putText(frame, f"R index: on line=note / arc below=jump  {row_hint}L hand=volume   "
+                "b semitones   ESC quit  c calibrate",
+                (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1, cv2.LINE_AA)
+
+
+def main():
+    cap = open_camera()
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)          # keep only the latest frame -> less lag
+
+    router = HandRouter()
+    pitch = PitchControl()
+    volume = VolumeControl()
+    semitones_on = False                         # 'b' toggles the black-key (sharp) row
+
+    with TonePlayer(freq=pitch.freq) as tone, mp_hands.Hands(
         model_complexity=0,
         max_num_hands=2,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     ) as hands:
-        smoothed_vol = 0.0
-        committed_key = WHITE_KEYS[len(WHITE_KEYS) // 2]   # currently pointed key
-        committed_black = False
-        chord_label = "single"
-        prev_pt = None                           # last frame's fingertip (x, y)
-        glide_freq = committed_key["freq"]       # actually-sounding pitch (glides)
-        tone.set_chord([committed_key["freq"]])
-        current_note = committed_key["name"]
-
         while cap.isOpened():
             ok, frame = cap.read()
             if not ok:
                 continue
+            frame = cv2.flip(frame, 1)           # selfie mirror
+            results = detect_hands(hands, frame)
 
-            frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb.flags.writeable = False
-            results = hands.process(rgb)
+            # Route hands, then drive pitch (right index) and volume (left openness).
+            pitch_hand, volume_hand = router.route(results)
+            pitch.update(pitch_hand, semitones_on)
+            tone.set_freq(pitch.freq)
+            tone.set_volume(volume.update(volume_hand))
 
-            pitch_hand, volume_hand = split_hands(results)
+            for hand in (pitch_hand, volume_hand):
+                if hand is not None:
+                    mp_drawing.draw_landmarks(
+                        frame, hand, mp_hands.HAND_CONNECTIONS,
+                        LANDMARK_STYLE, CONNECTION_STYLE)
+            draw_hud(frame, pitch, volume.value, semitones_on)
 
-            # RIGHT hand: index x picks the note, y picks the row (up=black keys,
-            # down=white). Finger count picks the chord (index only = single note).
-            if pitch_hand is not None:
-                tip = pitch_hand.landmark[INDEX_TIP]
-                p = np.array([tip.x, tip.y])
-                speed = 0.0 if prev_pt is None else float(np.hypot(*(p - prev_pt)))
-                prev_pt = p
-                committed_key, committed_black = pick_key(tip.x, tip.y)
-                current_note = committed_key["name"]
-                # Slide slowly -> smooth glide toward the pointed note; move fast
-                # -> jump to it. The per-frame glide rate (alpha) rises with finger
-                # speed, reaching 1.0 (instant jump) at GLIDE_JUMP_SPEED. We
-                # interpolate in log-frequency space so the sweep is musically even.
-                target_freq = committed_key["freq"]
-                alpha = float(np.clip(speed / GLIDE_JUMP_SPEED, GLIDE_MIN_ALPHA, 1.0))
-                glide_freq = math.exp(math.log(glide_freq)
-                                      + alpha * (math.log(target_freq) - math.log(glide_freq)))
-                offsets, chord_label = CHORDS.get(count_extended(pitch_hand.landmark),
-                                                  ([0], "single"))
-                tone.set_chord([glide_freq * (SEMITONE ** o) for o in offsets])
-                mp_drawing.draw_landmarks(
-                    frame, pitch_hand, mp_hands.HAND_CONNECTIONS,
-                    mp_styles.get_default_hand_landmarks_style(),
-                    mp_styles.get_default_hand_connections_style(),
-                )
-                h0, w0, _ = frame.shape
-                cv2.circle(frame, (int(tip.x * w0), int(tip.y * h0)), 10, (0, 255, 255), 2)
-            else:
-                prev_pt = None
-
-            # LEFT hand openness -> volume (silent when not visible).
-            target_vol = 0.0
-            if volume_hand is not None:
-                ratio = hand_openness(volume_hand.landmark)
-                target_vol = ratio_to_volume(ratio, lo, hi)
-                mp_drawing.draw_landmarks(
-                    frame, volume_hand, mp_hands.HAND_CONNECTIONS,
-                    mp_styles.get_default_hand_landmarks_style(),
-                    mp_styles.get_default_hand_connections_style(),
-                )
-            smoothed_vol += SMOOTHING * (target_vol - smoothed_vol)
-            tone.set_volume(smoothed_vol)
-
-            # ---- HUD ----
-            h, w, _ = frame.shape
-            # Two-row note ruler (black keys upper, white keys lower).
-            finger_x = pitch_hand.landmark[INDEX_TIP].x if pitch_hand is not None else None
-            draw_pitch_ruler(frame, committed_key, committed_black, finger_x)
-            pct = int(round(smoothed_vol * 100))
-            bar_w = int(smoothed_vol * (w - 40))
-            cv2.rectangle(frame, (20, h - 50), (w - 20, h - 20), (60, 60, 60), 2)
-            cv2.rectangle(frame, (20, h - 50), (20 + bar_w, h - 20), (0, 255, 0), cv2.FILLED)
-            cv2.putText(frame, f"Note: {current_note}   Chord: {chord_label}   Volume: {pct}%",
-                        (20, h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(frame, "R index: x=note  up=black/down=white  fingers=chord   "
-                        "L hand=volume   ESC quit  c calibrate",
-                        (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1, cv2.LINE_AA)
-
-            cv2.imshow("Gesture Orchestra - ESC quit, c calibrate", frame)
+            cv2.imshow(WINDOW, frame)
             key = cv2.waitKey(1) & 0xFF
-            if key == 27:                                    # ESC -> quit
+            if key == 27:                        # ESC -> quit
                 break
-            elif key == ord("c"):
-                lo, hi = calibrate(cap, hands)
+            elif key == ord("b"):                # toggle semitones (black keys)
+                semitones_on = not semitones_on
+            elif key == ord("c"):                # recalibrate the volume-hand range
+                volume.lo, volume.hi = calibrate(cap, hands)
 
     cap.release()
     cv2.destroyAllWindows()
@@ -582,16 +803,17 @@ def calibrate(cap, hands):
             if not ok:
                 continue
             frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            res = hands.process(rgb)
-            _, volume_hand = split_hands(res)
+            res = detect_hands(hands, frame)
+            # Calibration shows a single (left) hand -> just read whichever hand
+            # is detected, no role assignment needed.
+            volume_hand = res.multi_hand_landmarks[0] if res.multi_hand_landmarks else None
             ratio = hand_openness(volume_hand.landmark) if volume_hand is not None else None
             cv2.putText(frame, prompt, (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
                         0.7, (0, 255, 255), 2, cv2.LINE_AA)
             if ratio is not None:
                 cv2.putText(frame, f"ratio={ratio:.2f}", (20, 80),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.imshow("Gesture Orchestra - ESC quit, c calibrate", frame)
+            cv2.imshow(WINDOW, frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord(" ") and ratio is not None:
                 samples[stage] = ratio
